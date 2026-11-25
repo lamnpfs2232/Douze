@@ -3,37 +3,50 @@
 #include <Adafruit_APDS9999.h>
 #include <Adafruit_LSM6DS3TRC.h>
 
-const int   CONTROLLER_NUMBER = 17;
+const int   CONTROLLER_NUMBER = 16;
+- const charCONTROLLER_NAME   = 
+"Onze";
 
-const int LED_PINS[3] = {12, 27, 33};
-const unsigned long TARGET_ON_MS   = 2000;
-const unsigned long TARGET_GAP_MS  = 5000;
-const unsigned long TARGET_BLINK_MS = 250;
-const unsigned long WRONG_FLASH_MS = 150;
+const int GYRO_LED_PIN = 27;
+const int PROX_LED_PIN = 33;
 
-const int   PROX_FAR_RAW  = 6;
-const int   PROX_NEAR_RAW = 255;
-const bool  INVERT_PROXIMITY = false;
+const unsigned long STEP_MS     = 150;
+const unsigned long COOLDOWN_MS = 300;
 
-const float ZONE_UP_MAX   = 33.3;
-const float ZONE_DOWN_MIN = 66.7;
-const float HYSTERESIS    = 3.0;
-const float SMOOTHING     = 0.3;
+const int   PROX_DELTA        = 6;
+const unsigned long PROX_SAMPLE_MS = 30;
+const int   PROX_CONFIRM      = 2;
+const int   PROX_AVG          = 3;
+const float PROX_BASE_SPEED   = 0.01;
 
-const float FLICK_THRESHOLD = 7.0;
-const float FLICK_RESET     = 18.0;
+const apds9999_prox_resolution_t PROX_RES         = APDS9999_PROX_RES_11BIT;
+const apds9999_prox_meas_rate_t  PROX_RATE        = APDS9999_PROX_RATE_6MS;
+const apds9999_led_current_t     PROX_LED_CURRENT = APDS9999_LED_CURRENT_25MA;
+const uint8_t                    PROX_LED_PULSES  = 16;
 
-const int SIZE_FOR_HITS[4] = {100, 125, 150, 200};
+const float JOLT_THRESHOLD = 25.0;
+const float JOLT_RESET     = 3.0;
 
-const char* HIT_SOUND   = "laser";
-const char* SCORE_SOUND = "https://github.com/lamnpfs2232/Sound/raw/refs/heads/main/onze%20death%20sound.mp3";
-const char* WIN_SOUND   = "https://github.com/lamnpfs2232/Sound/raw/refs/heads/main/douze%20victory.mp3";
-const char* MUSIC       = "arcade";
+const int SIZE_FOR_LEDS[3] = {100, 150, 200};
 
-const int COLOR_FOR_HITS[4][3] = { {0, 200, 255}, {80, 255, 80}, {255, 220, 0}, {255, 40, 40} };
+const unsigned long SIZE_SETTLE_MS = 1500;
 
 const unsigned long POINT_DEBOUNCE_MS      = 2000;
 const unsigned long BUFF_RESET_FALLBACK_MS = 8000;
+
+- const char
+COLOR_FOR_LEDS[3] = {
+  "#39ff14",
+  "#ff4500",
+  "#ffd700"
+};
+
+- const charHIT_SOUND   = 
+"wood";
+- const charSCORE_SOUND = 
+"https://github.com/lamnpfs2232/Sound/raw/refs/heads/main/douze%20death%20sound.mp3";
+- const charWIN_SOUND   = 
+"https://github.com/lamnpfs2232/Sound/raw/refs/heads/main/onze%20victory.mp3";
 
 DFPongController    controller;
 Adafruit_APDS9999   apds;
@@ -42,34 +55,44 @@ Adafruit_LSM6DS3TRC imu;
 bool hasProx = false;
 bool hasImu  = false;
 
-float proxPercent = 50.0;
-int   proxZone    = NEUTRAL;
 uint16_t lastHandRaw = 0;
-int   handRaw = 0;
+int   handRaw      = 0;
+float proxBase     = -1;
+float proxDiff     = 0;
+bool  proxArmed    = true;
+int   proxAbove    = 0;
+int   proxHist[8];
+int   proxHistN    = 0;
+unsigned long proxSampleAt = 0;
+unsigned long proxLastAt   = 0;
+bool  proxLedOn    = false;
 
-const int LED_ZONE[3] = {DOWN, NEUTRAL, UP};
-bool          zoneHit[3]      = {false, false, false};
-int           hitsThisRound   = 0;
-int           targetLed       = -1;
-unsigned long targetShownAt   = 0;
-unsigned long nextTargetAt    = 0;
-unsigned long wrongFlashUntil = 0;
+float joltValue    = 0;
+bool  joltArmed    = true;
+unsigned long joltLastAt = 0;
+bool  gyroLedOn    = false;
 
-bool flickArmed = true;
+int   stepDirection = NEUTRAL;
+unsigned long stepEnd = 0;
 
-bool buffRound = false;
-bool resetSent = false;
+bool  buffRound = false;
+bool  resetSent = false;
 unsigned long buffRoundStartedAt = 0;
 unsigned long lastPointAt = 0;
+
+int   sentSize  = -1;
+int   sentColor = -1;
+bool  sizeDirty = false;
+unsigned long ledsChangedAt = 0;
 
 volatile bool pointEnded  = false;
 volatile bool matchStart  = false;
 volatile bool matchEnded  = false;
 volatile bool playStarted = false;
 
-// Called by the DF Pong library whenever the game sends me an event.
-// It only raises flags (point ended, match started or ended, rally started)
-// so that loop() can react to them safely.
+// Được gọi bởi thư viện DF Pong mỗi khi game gửi sự kiện về.
+// Hàm này chỉ bật các cờ báo hiệu khi kết thúc điểm,
+// để hàm loop() có thể xử lý chúng một cách an toàn.
 void gameEvent(int event, int value) {
   Serial.print("[event ");
   Serial.print(event);
@@ -83,50 +106,47 @@ void gameEvent(int event, int value) {
   if (event == EVENT_WON || event == EVENT_LOST)         matchEnded = true;
 }
 
-// Turns a light number (0, 1 or 2) into the name of its zone (DOWN, STOP
-// or UP). I use it for the Serial Monitor messages.
-const char* zoneName(int led) {
-  return led == 0 ? "DOWN" : led == 1 ? "STOP" : "UP";
+// Đếm số cặp mắt chuột chũi đang sáng hiện tại (0, 1 hoặc 2).
+// Con số này quyết định mức buff cho thanh đỡ (paddle).
+int ledsLit() {
+  return (gyroLedOn ? 1 : 0) + (proxLedOn ? 1 : 0);
 }
 
-// Sets the paddle color to match how many lights I have shot this round,
-// so the color shows my progress in the game.
-void showHitsColor(int hits) {
-  controller.setPlayerColor(COLOR_FOR_HITS[hits][0], COLOR_FOR_HITS[hits][1], COLOR_FOR_HITS[hits][2]);
+// Gửi kích thước thanh đỡ lên game, nhưng chỉ gửi khi khác với
+// kích thước lần trước để tránh spam cùng một giá trị lên game.
+void sendSize(int size) {
+  if (size == sentSize) return;
+  controller.setPaddleSize(size);
+  sentSize = size;
 }
 
-// Starts a fresh shooting round: clears all hits, turns the lights off,
-// puts the paddle color back to the base color, and schedules the first
-// target after a short pause.
-void startRound(unsigned long now) {
+// Gửi màu sắc thanh đỡ tương ứng với cấp độ buff (0, 1 hoặc 2) lên game,
+// cũng chỉ gửi khi có sự thay đổi.
+void sendColor(int level) {
+  if (level == sentColor) return;
+  controller.setPlayerColor(COLOR_FOR_LEDS[level]);
+  sentColor = level;
+}
+
+// Bắt đầu một hiệp tích điểm (earn round) mới: tắt cả hai mắt chuột chũi,
+// đưa thanh đỡ về kích thước bình thường và màu mặc định.
+void startRound() {
   buffRound = false;
-  for (int i = 0; i < 3; i++) zoneHit[i] = false;
-  hitsThisRound = 0;
-  showHitsColor(0);
-  targetLed     = -1;
-  nextTargetAt  = now + TARGET_GAP_MS;
+  gyroLedOn = false;
+  proxLedOn = false;
+  sizeDirty = false;
+  sendSize(SIZE_FOR_LEDS[0]);
+  sendColor(0);
 }
 
-// Picks a random light to be the next target, only among the zones I have
-// not shot yet. If all three are already shot, there is no target.
-void pickNewTarget(unsigned long now) {
-  int candidates[3];
-  int n = 0;
-  for (int i = 0; i < 3; i++) {
-    if (!zoneHit[i]) candidates[n++] = i;
-  }
-  if (n == 0) {
-    targetLed = -1;
-    return;
-  }
-  targetLed     = candidates[random(n)];
-  targetShownAt = now;
-  Serial.print("New target: ");
-  Serial.println(zoneName(targetLed));
+// Bắt đầu một bước di chuyển thanh đỡ (UP hoặc DOWN) kéo dài trong STEP_MS.
+void startStep(int direction, unsigned long now) {
+  stepDirection = direction;
+  stepEnd = now + STEP_MS;
 }
 
-// Reads the raw proximity value from the APDS9999.
-// If a reading fails, it returns the last good value instead.
+// Đọc giá trị tiệm cận thô từ cảm biến APDS9999.
+// Nếu đọc lỗi, hàm sẽ trả về giá trị hợp lệ gần nhất trước đó.
 int readProximityRaw() {
   uint16_t prox;
   if (apds.readProximity(&prox)) {
@@ -135,71 +155,82 @@ int readProximityRaw() {
   return (int)lastHandRaw;
 }
 
-// Converts the raw proximity into a position from 0% (far) to 100% (near).
-// The curve follows how reflected light fades with distance, so equal steps
-// in percent are roughly equal steps along the base.
-float proximityToPercent(int raw) {
-  float r     = (float)constrain(raw, PROX_FAR_RAW, PROX_NEAR_RAW);
-  float cm    = sqrtf((float)PROX_NEAR_RAW / r) - 1.0f;
-  float cmMax = sqrtf((float)PROX_NEAR_RAW / (float)PROX_FAR_RAW) - 1.0f;
-  cm = constrain(cm, 0.0f, cmMax);
-  float p = 100.0f - (cm * 100.0f / cmMax);
-  return INVERT_PROXIMITY ? 100.0f - p : p;
-}
+// Nút bên phải: trả về true một lần cho mỗi lần nhấn.
+// Hàm tính trung bình vài mẫu tiệm cận gần nhất và so sánh với mức nền (baseline)
+// thay đổi chậm. Một lần nhấn được tính khi giá trị trung bình vượt mức nền
+// trong PROX_CONFIRM mẫu liên tiếp, và giá trị phải giảm xuống lại trước khi
+// có thể tính lần nhấn tiếp theo.
+bool detectPress(int raw, unsigned long now) {
+  if (now - proxSampleAt < PROX_SAMPLE_MS) return false;
+  proxSampleAt = now;
 
-// Turns the position percentage into one of the three base zones
-// (UP, STOP or DOWN). A small dead band around each border stops the paddle
-// from flickering between two zones.
-int zoneFromPercent(float p, int currentZone) {
-  switch (currentZone) {
-    case UP:
-      return (p > ZONE_UP_MAX + HYSTERESIS) ? ((p >= ZONE_DOWN_MIN) ? DOWN : NEUTRAL) : UP;
-    case DOWN:
-      return (p < ZONE_DOWN_MIN - HYSTERESIS) ? ((p <= ZONE_UP_MAX) ? UP : NEUTRAL) : DOWN;
-    default:
-      if (p < ZONE_UP_MAX)   return UP;
-      if (p > ZONE_DOWN_MIN) return DOWN;
-      return NEUTRAL;
+  int n = constrain(PROX_AVG, 1, 8);
+  for (int i = min(proxHistN, n - 1); i > 0; i--) proxHist[i] = proxHist[i - 1];
+  proxHist[0] = raw;
+  if (proxHistN < n) proxHistN++;
+  float sum = 0;
+  for (int i = 0; i < proxHistN; i++) sum += proxHist[i];
+  float avg = sum / proxHistN;
+
+  if (proxBase < 0) { proxBase = avg; return false; }
+
+  proxDiff = avg - proxBase;
+  bool fired = false;
+
+  if (proxDiff < PROX_DELTA * 0.5f) proxArmed = true;
+  proxAbove = (proxDiff >= PROX_DELTA) ? proxAbove + 1 : 0;
+
+  if (proxArmed && proxAbove >= PROX_CONFIRM && now - proxLastAt > COOLDOWN_MS) {
+    proxArmed  = false;
+    proxLastAt = now;
+    fired = true;
   }
+
+  if (avg < proxBase) proxBase = avg;
+  else proxBase += PROX_BASE_SPEED * proxDiff;
+  return fired;
 }
 
-// Returns true once per trigger flick.
-// It measures the total rotation speed of the gyro on all three axes and
-// counts a flick when it passes FLICK_THRESHOLD. It only counts again after
-// the rotation drops below FLICK_RESET.
-bool detectFlick() {
+// Nút bên trái: trả về true một lần cho mỗi cú rung/đập (jolt).
+// Hàm lấy tổng gia tốc trừ đi trọng lực, nhờ đó khi đứng yên nút đọc được
+// xấp xỉ 0 và khi nhấn sẽ tạo ra một đỉnh xung. Giá trị phải ổn định
+// trở lại trước khi tính cú đập tiếp theo.
+bool detectJolt(unsigned long now) {
   if (!hasImu) return false;
   sensors_event_t accel, gyro, temp;
   imu.getEvent(&accel, &gyro, &temp);
-  float mag = sqrtf(gyro.gyro.x * gyro.gyro.x +
-                    gyro.gyro.y * gyro.gyro.y +
-                    gyro.gyro.z * gyro.gyro.z);
+-   float mag = sqrtf(accel.acceleration.x
+accel.acceleration.x +
+-                     accel.acceleration.y
+accel.acceleration.y +
+-                     accel.acceleration.z
+accel.acceleration.z);
+  joltValue = fabsf(mag - 9.81f);
 
-  if (flickArmed && mag > FLICK_THRESHOLD) {
-    flickArmed = false;
+  if (joltValue < JOLT_RESET) joltArmed = true;
+  if (joltArmed && joltValue > JOLT_THRESHOLD && now - joltLastAt > COOLDOWN_MS) {
+    joltArmed = false;
+    joltLastAt = now;
     return true;
-  }
-  if (!flickArmed && mag < FLICK_RESET) {
-    flickArmed = true;
   }
   return false;
 }
 
-// Reacts to the start of a match and to the end of each point.
-// After a shooting round with at least one hit, the next round becomes a
-// buff round with a bigger paddle. After a round with no hits, a new
-// shooting round starts. After a buff round, everything resets. A second
-// point event right after the first one is ignored.
+// Phản hồi khi bắt đầu trận đấu và khi kết thúc mỗi điểm.
+// Sau một hiệp tích điểm, nếu có đèn mắt sáng sẽ bắt đầu hiệp buff (kích thước
+// và màu theo số đèn sáng); nếu không có đèn nào sáng sẽ bắt đầu hiệp tích điểm mới.
+// Sau hiệp buff, mọi thứ được đặt lại. Sự kiện ghi điểm thứ hai xuất hiện ngay
+// sau sự kiện đầu tiên sẽ bị bỏ qua.
 void handleMatchStartAndPointEnd(unsigned long now) {
   if (matchStart) {
     matchStart = false;
-    controller.setPaddleSize(SIZE_FOR_HITS[0]);
-    startRound(now);
-    Serial.println("=== MATCH START: paddle normal, new round");
+    startRound();
+    Serial.println("=== MATCH START: paddle normal, new earn round");
   }
 
   if (pointEnded) {
     pointEnded = false;
+
     if (now - lastPointAt < POINT_DEBOUNCE_MS) {
       Serial.println("(second point event ignored)");
       return;
@@ -207,131 +238,111 @@ void handleMatchStartAndPointEnd(unsigned long now) {
     lastPointAt = now;
 
     if (!buffRound) {
-      if (hitsThisRound > 0) {
-        int size = SIZE_FOR_HITS[hitsThisRound];
-        controller.setPaddleSize(size);
+
+      int n = ledsLit();
+      if (n > 0) {
+        sendSize(SIZE_FOR_LEDS[n]);
+        sizeDirty = false;
+        sendColor(n);
         buffRound = true;
         resetSent = false;
         playStarted = false;
         buffRoundStartedAt = now;
-        targetLed = -1;
-        Serial.print("=== SHOOTING ROUND END: ");
-        Serial.print(hitsThisRound);
-        Serial.print(" hit(s) -> BUFF round, paddle ");
-        Serial.print(size);
+        Serial.print("=== EARN ROUND END: ");
+        Serial.print(n);
+        Serial.print(" pair(s) lit -> BUFF round, paddle ");
+        Serial.print(SIZE_FOR_LEDS[n]);
         Serial.println("%");
       } else {
-        startRound(now);
-        Serial.println("=== SHOOTING ROUND END: 0 hits -> new shooting round");
+        startRound();
+        Serial.println("=== EARN ROUND END: 0 lit -> new earn round");
       }
     } else {
-      controller.setPaddleSize(SIZE_FOR_HITS[0]);
-      startRound(now);
-      Serial.println("=== BUFF ROUND END: reset, new shooting round");
+
+      startRound();
+      Serial.println("=== BUFF ROUND END: reset, new earn round");
     }
   }
 }
 
-// During the buff round, once the rally has really started, sends the
-// normal paddle size so it applies from the next serve.
+// Trong hiệp buff, ngay khi pha bóng thực sự bắt đầu, gửi lại kích thước
+// thanh đỡ bình thường để áp dụng từ lượt giao bóng tiếp theo.
 void handleBuffResetQueue(unsigned long now) {
   if (buffRound && !resetSent &&
       (playStarted || now - buffRoundStartedAt > BUFF_RESET_FALLBACK_MS)) {
-    controller.setPaddleSize(SIZE_FOR_HITS[0]);
+    sendSize(SIZE_FOR_LEDS[0]);
     resetSent = true;
     Serial.println("Buff round under way: next serve goes back to normal size");
   }
 }
 
-// When the whole match is over, resets the paddle size and starts again
-// from a fresh shooting round.
-void handleMatchEnd(unsigned long now) {
+// Khi cả trận đấu kết thúc, đặt lại mọi thứ về trạng thái ban đầu.
+void handleMatchEnd() {
   if (matchEnded) {
     matchEnded = false;
-    controller.setPaddleSize(SIZE_FOR_HITS[0]);
-    startRound(now);
+    startRound();
     Serial.println("=== MATCH END: paddle back to normal");
   }
 }
 
-// Reads the proximity sensor and works out which base zone the gun is in
-// (UP, STOP or DOWN). The position is smoothed so small jitters do not move
-// the paddle.
-void updateHandZone() {
-  if (hasProx) {
-    handRaw = readProximityRaw();
-    proxPercent += SMOOTHING * (proximityToPercent(handRaw) - proxPercent);
-    proxZone = zoneFromPercent(proxPercent, proxZone);
-  }
-}
-
-// Controls the target light timing. A target stays on for TARGET_ON_MS,
-// then goes dark. After a pause a new random target is picked, as long as
-// it is a shooting round and not all three lights are shot yet.
-void handleTargetTiming(unsigned long now) {
-  if (!buffRound && targetLed >= 0 && (now - targetShownAt >= TARGET_ON_MS)) {
-    targetLed    = -1;
-    nextTargetAt = now + TARGET_GAP_MS;
-    Serial.println("Target expired");
-  }
-  if (!buffRound && targetLed < 0 && hitsThisRound < 3 && now >= nextTargetAt) {
-    pickNewTarget(now);
-  }
-}
-
-// Handles the trigger. A flick only counts as a hit when there is a target
-// light and the gun is in the matching zone. A hit keeps that light on,
-// adds one to the count, and sends the new paddle size and color. A flick
-// in the wrong zone makes the target flash off briefly. Flicks during the
-// buff round are ignored.
-void handleFlick(unsigned long now) {
-  if (detectFlick()) {
-    if (buffRound) {
-      Serial.println("Flick ignored: this is the BUFF round");
-    } else if (targetLed < 0) {
-      Serial.println("Flick but no target LED - nothing");
-    } else if (proxZone == LED_ZONE[targetLed]) {
-      zoneHit[targetLed] = true;
-      hitsThisRound++;
-      controller.setPaddleSize(SIZE_FOR_HITS[hitsThisRound]);
-      showHitsColor(hitsThisRound);
-      Serial.print("HIT ");
-      Serial.print(zoneName(targetLed));
-      Serial.print("  (hits this round: ");
-      Serial.print(hitsThisRound);
-      Serial.println(")");
-      targetLed    = -1;
-      nextTargetAt = now + TARGET_GAP_MS;
+// Nút bên trái: một cú đập (jolt) sẽ di chuyển thanh đỡ LÊN (UP) một bước.
+// Trong hiệp tích điểm, nó cũng bật/tắt đèn mắt của chuột chũi bên trái.
+void handleLeftButton(unsigned long now) {
+  if (detectJolt(now)) {
+    startStep(UP, now);
+    if (!buffRound) {
+      gyroLedOn = !gyroLedOn;
+      sizeDirty = true;  ledsChangedAt = now;
+      Serial.println("JOLT -> UP, LEDs 27 toggled");
     } else {
-      wrongFlashUntil = now + WRONG_FLASH_MS;
-      Serial.println("Flick in the WRONG zone");
+      Serial.println("JOLT -> UP (buff round: LEDs locked)");
     }
   }
 }
 
-// Shows the three lights. Shot zones stay on, the current target blinks,
-// and the target goes off for a moment after a wrong flick.
-void updateLeds(unsigned long now) {
-  for (int i = 0; i < 3; i++) {
-    bool on = false;
-    if (zoneHit[i]) {
-      on = true;
-    } else if (i == targetLed) {
-      bool blinkOn = (TARGET_BLINK_MS == 0) || (((now / TARGET_BLINK_MS) % 2) == 0);
-      on = blinkOn && (now >= wrongFlashUntil);
+// Nút bên phải: một lần nhấn sẽ di chuyển thanh đỡ XUỐNG (DOWN) một bước.
+// Trong hiệp tích điểm, nó cũng bật/tắt đèn mắt của chuột chũi bên phải.
+void handleRightButton(unsigned long now) {
+  if (!hasProx) return;
+  handRaw = readProximityRaw();
+  if (detectPress(handRaw, now)) {
+    startStep(DOWN, now);
+    if (!buffRound) {
+      proxLedOn = !proxLedOn;
+      sizeDirty = true;  ledsChangedAt = now;
+      Serial.println("PRESS -> DOWN, LEDs 33 toggled");
+    } else {
+      Serial.println("PRESS -> DOWN (buff round: LEDs locked)");
     }
-    digitalWrite(LED_PINS[i], on ? HIGH : LOW);
   }
 }
 
-// Sends the paddle command to the game (UP, STOP or DOWN) from the zone
-// the gun is in. Returns the command that was sent.
-int sendMovement() {
-  int command = proxZone;
+// Gửi kích thước thanh đỡ mới sau khi các đèn mắt ngừng thay đổi trong khoảng
+// SIZE_SETTLE_MS, giúp các thao tác bật/tắt liên tục chỉ gửi lên game một lần.
+void handleSizeSend(unsigned long now) {
+  if (sizeDirty && !buffRound && now - ledsChangedAt >= SIZE_SETTLE_MS) {
+    sendSize(SIZE_FOR_LEDS[ledsLit()]);
+    sizeDirty = false;
+  }
+}
+
+// Hiển thị trạng thái hai cặp mắt chuột chũi ra các chân LED.
+void updateLeds() {
+  digitalWrite(GYRO_LED_PIN, gyroLedOn ? HIGH : LOW);
+  digitalWrite(PROX_LED_PIN, proxLedOn ? HIGH : LOW);
+}
+
+// Gửi lệnh điều khiển thanh đỡ lên game: UP hoặc DOWN khi bước di chuyển
+// đang chạy, ngược lại là STOP. Trả về lệnh đã được gửi.
+int sendMovement(unsigned long now) {
+  int command = (now < stepEnd) ? stepDirection : NEUTRAL;
   controller.sendControl(command);
   return command;
 }
 
+// Chạy một lần khi khởi động: cấp nguồn cổng I2C, thiết lập các đèn LED và
+// cả hai cảm biến, sau đó cài đặt số hiệu, tên tay cầm, âm thanh, sự kiện
+// và khởi động Bluetooth.
 void setup() {
   Serial.begin(115200);
 
@@ -344,18 +355,20 @@ void setup() {
 #endif
   delay(50);
 
-  for (int i = 0; i < 3; i++) {
-    pinMode(LED_PINS[i], OUTPUT);
-    digitalWrite(LED_PINS[i], LOW);
-  }
-  randomSeed(esp_random());
-  startRound(millis());
+  pinMode(GYRO_LED_PIN, OUTPUT);
+  pinMode(PROX_LED_PIN, OUTPUT);
+  digitalWrite(GYRO_LED_PIN, LOW);
+  digitalWrite(PROX_LED_PIN, LOW);
 
   Wire.begin();
 
   hasProx = apds.begin();
   if (hasProx) {
     apds.enableProximitySensor(true);
+    apds.setProxResolution(PROX_RES);
+    apds.setProxMeasRate(PROX_RATE);
+    apds.setLEDCurrent(PROX_LED_CURRENT);
+    apds.setLEDPulses(PROX_LED_PULSES);
   } else {
     Serial.println("APDS9999 not found - check wiring");
   }
@@ -364,52 +377,60 @@ void setup() {
   if (!hasImu) {
     Serial.println("LSM6DS3TR-C not found - check wiring");
   } else {
-    imu.setGyroRange(LSM6DS_GYRO_RANGE_2000_DPS);
+    imu.setAccelRange(LSM6DS_ACCEL_RANGE_8_G);
+    imu.setAccelDataRate(LSM6DS_RATE_416_HZ);
   }
 
   controller.setControllerNumber(CONTROLLER_NUMBER);
-  controller.setControllerName("Douze");
-  controller.setPaddleSize(SIZE_FOR_HITS[0]);
+  controller.setControllerName(CONTROLLER_NAME);
   controller.setHitSound(HIT_SOUND);
   controller.setScoreSound(SCORE_SOUND);
   controller.setWinSound(WIN_SOUND);
-  controller.setMusic(MUSIC);
+  startRound();
   controller.setStatusLED(LED_BUILTIN);
   controller.onGameEvent(gameEvent);
   controller.begin();
 }
 
+// Chạy lặp lại liên tục: xử lý sự kiện game, đọc cả hai nút, gửi kích thước
+// và hướng di chuyển thanh đỡ, cập nhật đèn LED và in thông tin gỡ lỗi (debug).
 void loop() {
   controller.update();
   unsigned long now = millis();
 
   handleMatchStartAndPointEnd(now);
   handleBuffResetQueue(now);
-  handleMatchEnd(now);
-  updateHandZone();
-  handleTargetTiming(now);
-  handleFlick(now);
-  updateLeds(now);
-  int command = sendMovement();
+  handleMatchEnd();
+  handleLeftButton(now);
+  handleRightButton(now);
+  handleSizeSend(now);
+  updateLeds();
+  int command = sendMovement(now);
   printDebug(now, command);
 
   delay(5);
 }
 
-// Prints the live sensor values and state every 200 ms to the Serial
-// Monitor, which I use for tuning.
+// In giá trị cảm biến trực tiếp và trạng thái mỗi 200 ms ra Serial Monitor,
+// dùng để tinh chỉnh các ngưỡng (threshold).
 void printDebug(unsigned long now, int command) {
   static unsigned long lastPrint = 0;
   if (now - lastPrint <= 200) return;
   lastPrint = now;
-  Serial.print("hand raw: ");
+  Serial.print("jolt: ");
+  Serial.print(joltValue, 2);
+  Serial.print("  | hand raw: ");
   Serial.print(handRaw);
-  Serial.print("  percent: ");
-  Serial.print(proxPercent, 1);
-  Serial.print("  | target: ");
-  Serial.print(targetLed < 0 ? "none" : zoneName(targetLed));
-  Serial.print("  | hits: ");
-  Serial.print(hitsThisRound);
-  Serial.print(buffRound ? " [BUFF ROUND]" : " [shooting]");
+  Serial.print(" (base ");
+  Serial.print(proxBase, 1);
+  Serial.print(" diff ");
+  Serial.print(proxDiff, 1);
+  Serial.print(")");
+  Serial.print("  | LEDs 27: ");
+  Serial.print(gyroLedOn ? "ON" : "off");
+  Serial.print("  33: ");
+  Serial.print(proxLedOn ? "ON" : "off");
+  Serial.print(buffRound ? "  [BUFF ROUND]" : "  [earn]");
   Serial.print("  | cmd: ");
   Serial.println(command == UP ? "UP" : command == DOWN ? "DOWN" : "STOP");
+}
